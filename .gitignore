@@ -1,0 +1,12 @@
+# Upstream llama.cpp clone used as a working tree for the patch in
+# patches/. We don't check it in — its state is the base commit noted at
+# the top of the patch.
+llama.cpp/
+
+# Large model files downloaded for local testing
+*.gguf
+
+# Python
+__pycache__/
+*.pyc
+.venv/

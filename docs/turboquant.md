@@ -36,29 +36,59 @@ The patch adds a single new ggml tensor type, `GGML_TYPE_TQ_MSE_4`:
 | bits per element | 4 |
 | block layout | `fp16 scale` + `64 B` of packed nibbles (code indices) |
 | bits per value on disk | `66·8/128 = 4.125` |
-| vec-dot type | `F32` (query stays float, no extra precision loss) |
+| vec-dot type (CPU) | `F32` (query stays float, no extra precision loss) |
 
 It is reachable from the CLI as `--cache-type-k tq_mse_4`. The type can be
 used for K only (not V) — see "Why K only" below.
 
+Both the CPU path and a CUDA PoC path are in the same patch:
+
+| backend | KV write | KV read (dequant) | attention matmul |
+|---|---|---|---|
+| CPU    | ref `quantize_row_tq_mse_4`        | ref `dequantize_row_tq_mse_4` | scratch-dequant + plain F32 dot |
+| CUDA   | fused kernel, 128 threads / block  | fused kernel, 128 threads / block | cuBLAS F32 fallback (K dequantized to a scratch buffer by `ggml_cuda_dequantize_row_tq_mse_4_fp32`) |
+
+Both backends build the rotation matrix `Π` and codebook on the CPU from the
+same deterministic xoshiro256** seed; the CUDA path then `cudaMemcpyToSymbol`s
+the tables into `__device__` globals. As a result a CPU-quantized block and a
+GPU-quantized block of the same input are byte-identical (up to a few
+border-case rounding differences where a rotated coord lands exactly on a
+codebook midpoint), and a dequantized vector from either backend matches to a
+few ULPs.
+
 ### Files changed
 
-The patch touches 13 files under `llama.cpp/`:
+The patch touches 19 files under `llama.cpp/`:
+
+CPU path (15 files):
 
 ```
-common/arg.cpp              +1   # expose tq_mse_4 to --cache-type-k parser
-ggml/include/ggml.h         +2   # GGML_TYPE_TQ_MSE_4 = 42, COUNT = 43
-ggml/src/ggml-common.h      +11  # block_tq_mse_4 struct + QK_TQ_MSE_4
-ggml/src/ggml-cpu/ggml-cpu.c +6  # type_traits_cpu entry
-ggml/src/ggml-cpu/ops.cpp   +1   # clamp switch case (no-op)
-ggml/src/ggml-cpu/quants.c  +39  # from_float forwarder + vec_dot
-ggml/src/ggml-cpu/quants.h  +5   # declarations
-ggml/src/ggml-quants.c      +233 # codebook, rotation, quant/dequant, PRNG, init
-ggml/src/ggml-quants.h      +9   # declarations
-ggml/src/ggml.c             +9   # ggml_type_traits entry + init dispatch
-tests/CMakeLists.txt        +1
-tests/test-quantize-fns.cpp +15  # buffer-size fix + per-type error bound
-tests/test-turboquant.cpp   +128 # new: round-trip + vec_dot sanity
+common/arg.cpp                  +1    # expose tq_mse_4 to --cache-type-k parser
+ggml/include/ggml.h             +2    # GGML_TYPE_TQ_MSE_4 = 42, COUNT = 43
+ggml/src/ggml-common.h          +11   # block_tq_mse_4 struct + QK_TQ_MSE_4
+ggml/src/ggml-cpu/ggml-cpu.c    +6    # type_traits_cpu entry
+ggml/src/ggml-cpu/ops.cpp       +1    # clamp switch case (no-op)
+ggml/src/ggml-cpu/quants.c      +39   # from_float forwarder + vec_dot
+ggml/src/ggml-cpu/quants.h      +5    # declarations
+ggml/src/ggml-quants.c          +252  # codebook, rotation, quant/dequant,
+                                      #  PRNG, init, host-side accessors
+ggml/src/ggml-quants.h          +16   # declarations
+ggml/src/ggml.c                 +9    # ggml_type_traits entry + init dispatch
+tests/CMakeLists.txt            +2    # register both turboquant tests
+tests/test-quantize-fns.cpp     +15   # buffer-size fix + per-type error bound
+tests/test-turboquant.cpp       +131  # round-trip + vec_dot sanity (CPU)
+```
+
+CUDA path (4 files):
+
+```
+ggml/src/ggml-cuda/convert.cu   +5    # register fp32/fp16 dequant in the to-*_cuda tables
+ggml/src/ggml-cuda/cpy.cu       +7    # dispatch F32↔TQ_MSE_4 on CUDA
+ggml/src/ggml-cuda/ggml-cuda.cu +14   # supports_op: allow CPY + MUL_MAT;
+                                      # exclude TQ from MMVQ / MMQ to force cuBLAS fallback
+ggml/src/ggml-cuda/tq_mse_4.cu  +344  # device tables, init, quant/dequant kernels
+ggml/src/ggml-cuda/tq_mse_4.cuh +45   # declarations
+tests/test-turboquant-cuda.cpp  +206  # CPU ↔ GPU parity + GPU round-trip
 ```
 
 ## Design decisions
@@ -197,13 +227,85 @@ End-to-end sanity:
 # Generates "Paris"
 ```
 
+## CUDA path specifics
+
+### Tables
+
+`Π`, `Πᵀ`, and the 16-entry codebook live in three `__device__` arrays in
+`ggml-cuda/tq_mse_4.cu`. `Π` and `Πᵀ` are 128×128 floats each, i.e. 64 KB
+apiece — too big for `__constant__` on most GPUs, hence ordinary global
+memory. The tables are populated on first use by
+`ggml_cuda_tq_mse_4_init`, which calls the CPU-side `tq_mse_4_init_impl`
+(idempotent), reads the already-built host tables via the exported
+`ggml_tq_mse_4_host_pi` / `piT` / `codebook` accessors, and
+`cudaMemcpyToSymbolAsync`es them across. A `std::once_flag` guards against
+repeat uploads.
+
+### Kernels
+
+Two kernels, both launched as one CUDA block (128 threads) per TQ output
+block:
+
+1. **`cpy_f32_to_tq_mse_4_kernel`** (KV write).
+   Thread `t` owns rotated coord `y[t]`. Stages `x[]` in shared memory,
+   reduces `‖x‖²`, computes `y[t] = Π[t,:]·x / ‖x‖`, argmin against 16
+   centroids, writes the packed nibble at `qs[t/2]` (thread pairs
+   cooperate on the byte).
+2. **`cpy_tq_mse_4_to_f32_kernel`** (KV read / dequant).
+   Thread `t` unpacks one nibble into `y_rot[]`, then computes
+   `x[t] = scale · Σ_j Πᵀ[t,j]·y_rot[j]`. This access pattern *is*
+   coalesced (`Πᵀ[t,*]` read by adjacent threads stride by 4 bytes).
+
+### Matmul path
+
+The CUDA backend claims to support `MUL_MAT` with TQ as `src0` (see
+`supports_op` in `ggml-cuda.cu`), but forces `use_mul_mat_vec_q` and
+`use_mul_mat_q` off for this type. That makes `ggml_cuda_mul_mat` fall
+through to `ggml_cuda_op_mul_mat_cublas`, which dequantizes `K` to an
+F32 (or F16) scratch buffer via `ggml_get_to_fp32_cuda(GGML_TYPE_TQ_MSE_4)`
+and then runs a regular cuBLAS GEMM. All of this stays on GPU memory —
+no CPU fallback round-trip.
+
+Flash-attention is *not* enabled for this type (intentionally — the flash-attn
+kernel template machinery would cost a lot of `.cu` instance files for what
+is a first-cut PoC). Without flash-attn, llama.cpp falls back to explicit
+`ggml_mul_mat(K, Q) + softmax + ggml_mul_mat(V, kq_soft)`, which is the
+path that goes through the dequant above.
+
+### Parity with CPU
+
+Since both backends use literally the same `Π` and codebook, round-trips
+are bit-identical up to matmul order: the `Πᵀ·y_rot` sum is accumulated
+in a different order on the two backends (scalar vs. 128 threads), which
+can differ by a few ULPs in the last place. The CUDA test
+(`test-turboquant-cuda.cpp`) checks that:
+
+- Packed bytes agree on ≥95% of blocks (the 5% slack absorbs the
+  rare case where a rotated coord lands exactly on a codebook midpoint
+  and the two backends round differently).
+- Max element-wise dequant diff is below 5e-3.
+- Round-trip MSE on GPU is within the CPU ballpark (~7e-5 per coord on
+  unit vectors).
+
 ## Known limits / future work
 
 - **MSE only.** Algorithm 2 of the paper (TurboQuantProd: MSE stage +
   JL-sign residual) is not implemented; it doesn't fit one block cleanly
   because it emits a `(idx, sign_bits, γ)` triple.
-- **CPU only.** No CUDA / Metal / Vulkan kernel. Those backends each ship
-  their own quantized-matmul paths and would each need a port.
+- **No fused vec-dot on CUDA.** The clever identity
+  `<Πᵀỹ, q> = <ỹ, Πq>` lets you precompute `Πq` once per row and reduce
+  each block's contribution to a plain 128-way dot. That's the real
+  performance win and belongs in `fattn-common.cuh`, not in the cpy
+  kernels. The current CUDA path uses the cuBLAS F32 fallback, which
+  dequantizes K to F32 scratch every attention call — correct but not
+  the intended speedup.
+- **No flash-attention on CUDA for this type.** Adding it means ~14 new
+  `fattn-vec-instance-*.cu` files (TQ-as-K × every V type, and vice-versa).
+  Worth doing once the perplexity numbers confirm quality.
+- **Pi stored in one orientation only on CUDA.** The quant kernel's Π
+  reads are uncoalesced. A row+column-major mirror of Π (another 64 KB
+  per GPU) would fix this. Trivial follow-up.
+- **No Metal / Vulkan / ROCm ports.** CUDA only.
 - **No perplexity numbers yet.** A baseline-vs-TQ perplexity comparison on a
   held-out corpus would be the right next step to validate the paper's
   guarantees end-to-end inside a real LLM.

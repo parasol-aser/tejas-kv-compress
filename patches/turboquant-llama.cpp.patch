@@ -1,9 +1,15 @@
 # TurboQuant KV-cache quant type (GGML_TYPE_TQ_MSE_4) for llama.cpp
 #
-# Adds a CPU-only KV-cache quantization format implementing Algorithm 1 of
-# TurboQuant (arXiv:2504.19874): per-head random rotation + Lloyd-Max codebook
-# on the rotated coordinates.  Block size 128 (head dim), 4 bits per element
-# plus a shared fp16 norm scale; ~4.125 bpv.  Exposed via --cache-type-k.
+# Adds a KV-cache quantization format implementing Algorithm 1 of
+# TurboQuant (arXiv:2504.19874): per-head random rotation + Lloyd-Max
+# codebook on the rotated coordinates.  Block size 128 (head dim), 4
+# bits per element plus a shared fp16 norm scale; ~4.125 bpv.  Exposed
+# via --cache-type-k.
+#
+# CPU: full path (quantize, dequantize, vec_dot via scratch dequant).
+# CUDA: KV write (F32 -> TQ_MSE_4), KV read (TQ_MSE_4 -> F32 / F16) and
+# therefore attention via cuBLAS F32 fallback. No quant-quant kernel, no
+# flash-attention path (yet).
 #
 # Base commit (upstream ggml-org/llama.cpp):
 #   cf8b0dbda server : remove /api endpoints (#22165)
@@ -12,11 +18,16 @@
 #   cd llama.cpp
 #   git apply ../patches/turboquant-llama.cpp.patch
 #
-# Build & test:
+# Build & test (CPU):
 #   cmake -B build -DGGML_CUDA=OFF
 #   cmake --build build -j
 #   ./build/bin/test-turboquant
-#   ./build/bin/llama-completion -m model.gguf -p "..." --cache-type-k tq_mse_4 --jinja
+#   ./build/bin/llama-completion -m model.gguf -p "..." \
+#       --cache-type-k tq_mse_4 --jinja
+#
+# Build & test (CUDA):
+#   scripts/test-cuda-turboquant.sh          # runs everything
+#   scripts/test-cuda-turboquant.sh -m model.gguf   # + end-to-end gen
 #
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 099f0aeab..644b1aa93 100644
@@ -168,8 +179,506 @@ index d4bc87a1c..b4b4e47a1 100644
  void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq2_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq2_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 61630a35a..419803f62 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -1,5 +1,6 @@
+ #include "convert.cuh"
+ #include "dequantize.cuh"
++#include "tq_mse_4.cuh"
+ 
+ #include <cstdint>
+ 
+@@ -762,6 +763,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return convert_unary_cont_cuda<float>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cont_cuda<nv_bfloat16>;
++        case GGML_TYPE_TQ_MSE_4:
++            return ggml_cuda_dequantize_row_tq_mse_4_fp16;
+         default:
+             return nullptr;
+     }
+@@ -817,6 +820,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return convert_unary_cont_cuda<half>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cont_cuda<nv_bfloat16>;
++        case GGML_TYPE_TQ_MSE_4:
++            return ggml_cuda_dequantize_row_tq_mse_4_fp32;
+         default:
+             return nullptr;
+     }
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index d208acf2d..c1cc209d7 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -1,6 +1,7 @@
+ #include "cpy.cuh"
+ #include "dequantize.cuh"
+ #include "cpy-utils.cuh"
++#include "tq_mse_4.cuh"
+ #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
+ #include "ggml-musa/mudnn.cuh"
+ #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
+@@ -474,6 +475,12 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     } else if (src0->type == GGML_TYPE_Q5_1 && src1->type == GGML_TYPE_F32) {
+         ggml_cpy_q5_1_f32_cuda
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TQ_MSE_4) {
++        ggml_cuda_cpy_f32_to_tq_mse_4
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++    } else if (src0->type == GGML_TYPE_TQ_MSE_4 && src1->type == GGML_TYPE_F32) {
++        ggml_cuda_cpy_tq_mse_4_to_f32
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
+         if (can_be_transposed) {
+             ggml_cpy_scalar_cuda<half, half, true>
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ecd12b80d..4bd261dc2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2376,10 +2376,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
++    // TurboQuant has no quant-quant vec_dot kernel (yet), so its CUDA path
++    // must skip MMVQ / MMQ and fall through to the cuBLAS F32 fallback,
++    // which goes via ggml_cuda_dequantize_row_tq_mse_4_fp32 in convert.cu.
++    const bool is_turboquant = (src0->type == GGML_TYPE_TQ_MSE_4);
++
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
++        && !is_turboquant
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
++        && !is_turboquant
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+ 
+     bool any_gpus_with_slow_fp16 = false;
+@@ -4875,6 +4882,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_IQ4_XS:
+                     case GGML_TYPE_BF16:
++                    case GGML_TYPE_TQ_MSE_4:
+                         return true;
+                     default:
+                         return false;
+@@ -4958,6 +4966,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 if (src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_F32) {
+                     return true;
+                 }
++                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ_MSE_4) {
++                    return true;
++                }
++                if (src0_type == GGML_TYPE_TQ_MSE_4 && src1_type == GGML_TYPE_F32) {
++                    return true;
++                }
+                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
+                     return true;
+                 }
+diff --git a/ggml/src/ggml-cuda/tq_mse_4.cu b/ggml/src/ggml-cuda/tq_mse_4.cu
+new file mode 100644
+index 000000000..7b4fab355
+--- /dev/null
++++ b/ggml/src/ggml-cuda/tq_mse_4.cu
+@@ -0,0 +1,344 @@
++// CUDA port of GGML_TYPE_TQ_MSE_4 (TurboQuant MSE, 4-bit, d=128).
++//
++// The CPU reference (ggml/src/ggml-quants.c) owns the table construction
++// (xoshiro256** + Box-Muller + modified Gram-Schmidt) so both backends use
++// literally the same Pi and codebook. We just cudaMemcpyToSymbol the tables
++// across on first use.
++//
++// Scope of this first PoC:
++//   * F32 -> TQ_MSE_4  (KV cache write)
++//   * TQ_MSE_4 -> F32  (dequant for CPU-fallback matmul)
++//   * No quant-quant vec-dot, no flash-attn integration — the CUDA
++//     supports_op switch deliberately leaves GGML_TYPE_TQ_MSE_4 out of the
++//     mul_mat list so the backend scheduler falls back to CPU for attention.
++//
++// Perf notes (TODO for a follow-up):
++//   * The quantize kernel reads Pi row-major with a column-stride access
++//     pattern across threads, which is uncoalesced. A column-major copy of
++//     Pi would fix this. For correctness-first PoC this is fine.
++//   * The dequantize kernel's Pi^T access is already coalesced.
++//   * No fused vec-dot that exploits <y_rot, Pi q> — that's the real
++//     perf win and belongs in fattn-common.cuh, not here.
++
++#include "tq_mse_4.cuh"
++#include "ggml-quants.h"   // tq_mse_4_init_impl on the CPU side
++
++#include <mutex>
++
++#define TQ_D 128
++#define TQ_K 16   // 2^4 codebook entries
++
++// -----------------------------------------------------------------------------
++// Device-side tables.
++// -----------------------------------------------------------------------------
++// 128*128 = 16384 floats = 64 KB for each of Pi, Pi^T. __constant__ can't hold
++// 64 KB so we keep them in ordinary __device__ global memory.
++__device__ float d_tq_pi  [TQ_D * TQ_D];
++__device__ float d_tq_piT [TQ_D * TQ_D];
++__device__ float d_tq_codebook[TQ_K];
++
++static std::once_flag g_tq_cuda_init_flag;
++
++// -----------------------------------------------------------------------------
++// Host-side init: mirror the CPU tables onto the device once per process.
++// -----------------------------------------------------------------------------
++void ggml_cuda_tq_mse_4_init(cudaStream_t stream) {
++    std::call_once(g_tq_cuda_init_flag, [stream]() {
++        // Make sure the CPU-side build has happened. tq_mse_4_init_impl is a
++        // C API in ggml-quants.h and is itself idempotent / thread-safe.
++        tq_mse_4_init_impl();
++
++        // Pull the CPU tables out via the ref quant/dequant paths. They
++        // aren't exposed as C symbols, so we reconstruct them by doing a
++        // round-trip on known inputs... or we can just declare them extern.
++        // Simpler: expose the raw buffers. Since this file lives in the ggml
++        // tree we can pull them in via a small C helper.
++        extern const float * ggml_tq_mse_4_host_pi (void);
++        extern const float * ggml_tq_mse_4_host_piT(void);
++        extern const float * ggml_tq_mse_4_host_codebook(void);
++
++        const float * h_pi        = ggml_tq_mse_4_host_pi();
++        const float * h_piT       = ggml_tq_mse_4_host_piT();
++        const float * h_codebook  = ggml_tq_mse_4_host_codebook();
++
++        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_tq_pi,       h_pi,       sizeof(float)*TQ_D*TQ_D, 0, cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_tq_piT,      h_piT,      sizeof(float)*TQ_D*TQ_D, 0, cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_tq_codebook, h_codebook, sizeof(float)*TQ_K,       0, cudaMemcpyHostToDevice, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    });
++}
++
++// -----------------------------------------------------------------------------
++// Helper: locate the source float row and destination block for CUDA block
++// index = linear output-block index `ib`.
++// -----------------------------------------------------------------------------
++// We pack the 4D indexing the same way cpy_f32_q does. 128 output elements
++// per TQ block, `i` is the flat element index of the first element in this
++// block.
++__device__ static inline void tq_src_dst_offsets(
++        int64_t ib,
++        int64_t ne00, int64_t ne01, int64_t ne02,
++        int64_t nb00, int64_t nb01, int64_t nb02, int64_t nb03,
++        int64_t ne10, int64_t ne11, int64_t ne12,
++        int64_t nb10, int64_t nb11, int64_t nb12, int64_t nb13,
++        int qk,
++        int64_t & x_offset, int64_t & dst_offset) {
++    const int64_t i = ib * qk;
++
++    const int64_t i03 = i / (ne00 * ne01 * ne02);
++    const int64_t i02 = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
++    const int64_t i01 = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
++    const int64_t i00 =  i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
++    x_offset = i00 * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
++
++    const int64_t i13 = i / (ne10 * ne11 * ne12);
++    const int64_t i12 = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
++    const int64_t i11 = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
++    const int64_t i10 =  i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
++    dst_offset = (i10 / qk) * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
++}
++
++// -----------------------------------------------------------------------------
++// Quantize kernel: F32 -> block_tq_mse_4. One CUDA block per TQ block, 128
++// threads. Each thread owns one of the 128 rotated coords.
++// -----------------------------------------------------------------------------
++__global__ static void cpy_f32_to_tq_mse_4_kernel(
++        const char * cx, char * cdst,
++        const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++
++    const int64_t ib = blockIdx.x;
++    if (ib * TQ_D >= ne) return;
++
++    int64_t x_offset, dst_offset;
++    tq_src_dst_offsets(ib,
++                       ne00, ne01, ne02, nb00, nb01, nb02, nb03,
++                       ne10, ne11, ne12, nb10, nb11, nb12, nb13,
++                       TQ_D, x_offset, dst_offset);
++
++    const float    * __restrict__ x = (const float *)(cx + x_offset);
++    block_tq_mse_4 * __restrict__ y = (block_tq_mse_4 *)(cdst + dst_offset);
++
++    const int t = threadIdx.x;  // 0..127
++
++    // 1. Stage x[] in shared memory for repeated reads during Pi * x.
++    __shared__ float x_sh[TQ_D];
++    x_sh[t] = x[t];
++    __syncthreads();
++
++    // 2. ||x||^2 via a shared-memory reduction.
++    __shared__ float reduce[TQ_D];
++    reduce[t] = x_sh[t] * x_sh[t];
++    __syncthreads();
++    for (int s = TQ_D / 2; s > 0; s >>= 1) {
++        if (t < s) reduce[t] += reduce[t + s];
++        __syncthreads();
++    }
++    const float norm     = sqrtf(reduce[0]);
++    const float inv_norm = (norm > 1e-20f) ? (1.0f / norm) : 0.0f;
++
++    // 3. y_rot[t] = (1/norm) * sum_j Pi[t, j] * x[j].
++    //    Pi is stored row-major with a 128-stride, so reads across threads at
++    //    fixed j are 128 floats apart — uncoalesced. Accepted for the PoC.
++    float yt = 0.0f;
++    #pragma unroll 8
++    for (int j = 0; j < TQ_D; ++j) {
++        yt += d_tq_pi[t * TQ_D + j] * x_sh[j];
++    }
++    yt *= inv_norm;
++
++    // 4. Find nearest codebook entry. Codebook is symmetric and ascending,
++    //    so a linear 16-way scan is fine.
++    int   best_i = 0;
++    float best_d = fabsf(yt - d_tq_codebook[0]);
++    #pragma unroll
++    for (int i = 1; i < TQ_K; ++i) {
++        const float d = fabsf(yt - d_tq_codebook[i]);
++        if (d < best_d) { best_d = d; best_i = i; }
++    }
++
++    // 5. Pack nibbles. Each byte qs[t/2] holds two 4-bit indices (low = even
++    //    thread, high = odd thread).
++    __shared__ uint8_t idx_sh[TQ_D];
++    idx_sh[t] = (uint8_t) best_i;
++    __syncthreads();
++
++    if (t < TQ_D / 2) {
++        const uint8_t lo = idx_sh[2*t    ];
++        const uint8_t hi = idx_sh[2*t + 1];
++        y->qs[t] = (uint8_t)((lo & 0x0F) | (hi << 4));
++    }
++
++    // 6. Store the scale. On CUDA ggml_half is __half, which has an
++    //    implicit float conversion.
++    if (t == 0) {
++        y->d = norm;
++    }
++}
++
++// -----------------------------------------------------------------------------
++// Dequantize kernel: block_tq_mse_4 -> F32. One CUDA block per TQ block,
++// 128 threads. Each thread owns one output coord x[t].
++// -----------------------------------------------------------------------------
++__global__ static void cpy_tq_mse_4_to_f32_kernel(
++        const char * cx, char * cdst,
++        const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++
++    const int64_t ib = blockIdx.x;
++    if (ib * TQ_D >= ne) return;
++
++    // The cpy_q_f32 kernel uses `(i00 / qk) * nb00` on the src side and a
++    // per-element stride on the dst side. Reuse its indexing logic:
++    const int64_t i = ib * TQ_D;
++
++    const int64_t i03 = i / (ne00 * ne01 * ne02);
++    const int64_t i02 = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
++    const int64_t i01 = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
++    const int64_t i00 =  i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
++    const int64_t x_offset = (i00 / TQ_D) * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
++
++    const int64_t i13 = i / (ne10 * ne11 * ne12);
++    const int64_t i12 = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
++    const int64_t i11 = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
++    const int64_t i10 =  i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
++    const int64_t dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
++
++    const block_tq_mse_4 * __restrict__ x = (const block_tq_mse_4 *)(cx + x_offset);
++    float                * __restrict__ y = (float                *)(cdst + dst_offset);
++
++    const int t = threadIdx.x;  // 0..127
++
++    // 1. Unpack nibbles -> y_rot in shared memory.
++    __shared__ float y_rot[TQ_D];
++    if (t < TQ_D / 2) {
++        const uint8_t byte = x->qs[t];
++        y_rot[2*t    ] = d_tq_codebook[byte & 0x0F];
++        y_rot[2*t + 1] = d_tq_codebook[byte >>   4];
++    }
++    __syncthreads();
++
++    // 2. Read the fp16 scale. ggml_half == __half on CUDA; cast to float.
++    const float scale = (float) x->d;
++
++    // 3. x[t] = scale * sum_j Pi^T[t, j] * y_rot[j]
++    //    Pi^T stored row-major. Across warp lanes, at fixed j, threads t read
++    //    piT[t*128 + j] — strided 128 floats. Not coalesced in this layout
++    //    either. (Coalescing would need Pi^T stored column-major; fine for
++    //    the PoC.)
++    float acc = 0.0f;
++    #pragma unroll 8
++    for (int j = 0; j < TQ_D; ++j) {
++        acc += d_tq_piT[t * TQ_D + j] * y_rot[j];
++    }
++    y[t] = scale * acc;
++}
++
++// -----------------------------------------------------------------------------
++// Host launchers.
++// -----------------------------------------------------------------------------
++void ggml_cuda_cpy_f32_to_tq_mse_4(
++        const char * cx, char * cdst, const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
++        cudaStream_t stream) {
++
++    GGML_ASSERT(ne % TQ_D == 0);
++    const int64_t num_blocks = ne / TQ_D;
++    GGML_ASSERT(num_blocks < UINT_MAX);
++
++    ggml_cuda_tq_mse_4_init(stream);
++
++    cpy_f32_to_tq_mse_4_kernel<<<(unsigned)num_blocks, TQ_D, 0, stream>>>(
++        cx, cdst, ne,
++        ne00, ne01, ne02, nb00, nb01, nb02, nb03,
++        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
++}
++
++void ggml_cuda_cpy_tq_mse_4_to_f32(
++        const char * cx, char * cdst, const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
++        cudaStream_t stream) {
++
++    GGML_ASSERT(ne % TQ_D == 0);
++    const int64_t num_blocks = ne / TQ_D;
++    GGML_ASSERT(num_blocks < UINT_MAX);
++
++    ggml_cuda_tq_mse_4_init(stream);
++
++    cpy_tq_mse_4_to_f32_kernel<<<(unsigned)num_blocks, TQ_D, 0, stream>>>(
++        cx, cdst, ne,
++        ne00, ne01, ne02, nb00, nb01, nb02, nb03,
++        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
++}
++
++// -----------------------------------------------------------------------------
++// Contiguous dequant for the cuBLAS F32 fallback matmul path.
++//
++// Much simpler than the strided cpy path: input is a tightly-packed array of
++// blocks, output is a flat float buffer of length k = num_blocks * 128.
++// -----------------------------------------------------------------------------
++template <typename dst_t>
++__global__ static void dequantize_block_tq_mse_4_kernel(
++        const block_tq_mse_4 * __restrict__ x, dst_t * __restrict__ y, const int64_t nb) {
++
++    const int64_t ib = blockIdx.x;
++    if (ib >= nb) return;
++
++    const block_tq_mse_4 * xb = x + ib;
++    dst_t                * yb = y + ib * TQ_D;
++
++    const int t = threadIdx.x;  // 0..127
++
++    __shared__ float y_rot[TQ_D];
++    if (t < TQ_D / 2) {
++        const uint8_t byte = xb->qs[t];
++        y_rot[2*t    ] = d_tq_codebook[byte & 0x0F];
++        y_rot[2*t + 1] = d_tq_codebook[byte >>   4];
++    }
++    __syncthreads();
++
++    const float scale = (float) xb->d;
++
++    float acc = 0.0f;
++    #pragma unroll 8
++    for (int j = 0; j < TQ_D; ++j) {
++        acc += d_tq_piT[t * TQ_D + j] * y_rot[j];
++    }
++
++    const float out = scale * acc;
++    if constexpr (std::is_same_v<dst_t, half>) {
++        yb[t] = __float2half(out);
++    } else {
++        yb[t] = out;
++    }
++}
++
++void ggml_cuda_dequantize_row_tq_mse_4_fp32(
++        const void * vx, float * y, int64_t k, cudaStream_t stream) {
++    GGML_ASSERT(k % TQ_D == 0);
++    const int64_t nb = k / TQ_D;
++    ggml_cuda_tq_mse_4_init(stream);
++    dequantize_block_tq_mse_4_kernel<float><<<(unsigned)nb, TQ_D, 0, stream>>>(
++        (const block_tq_mse_4 *) vx, y, nb);
++}
++
++void ggml_cuda_dequantize_row_tq_mse_4_fp16(
++        const void * vx, half * y, int64_t k, cudaStream_t stream) {
++    GGML_ASSERT(k % TQ_D == 0);
++    const int64_t nb = k / TQ_D;
++    ggml_cuda_tq_mse_4_init(stream);
++    dequantize_block_tq_mse_4_kernel<half><<<(unsigned)nb, TQ_D, 0, stream>>>(
++        (const block_tq_mse_4 *) vx, y, nb);
++}
+diff --git a/ggml/src/ggml-cuda/tq_mse_4.cuh b/ggml/src/ggml-cuda/tq_mse_4.cuh
+new file mode 100644
+index 000000000..ec8db107e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/tq_mse_4.cuh
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include "common.cuh"
++
++// CUDA path for GGML_TYPE_TQ_MSE_4 (TurboQuant MSE, 4-bit, d=128).
++//
++// The rotation matrix Pi and the 16-entry codebook are built on the CPU by
++// tq_mse_4_init_impl() (see ggml/src/ggml-quants.c) and then copied to
++// device-side tables on first use by ggml_cuda_tq_mse_4_init(). This
++// guarantees bit-identical Pi / codebook across CPU and CUDA so a round
++// trip through either backend is byte-exact.
++//
++// Host entrypoints:
++
++// Call once (implicitly from cpy wrappers) to push CPU tables to device.
++void ggml_cuda_tq_mse_4_init(cudaStream_t stream);
++
++// F32 src -> TQ_MSE_4 dst (KV-cache write path). The "ne*" / "nb*" args are
++// the same ones that the generic cpy_f32_q kernel takes — we need them to
++// walk the 4D tensor.
++void ggml_cuda_cpy_f32_to_tq_mse_4(
++        const char * cx, char * cdst, const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
++        cudaStream_t stream);
++
++// TQ_MSE_4 src -> F32 dst (KV-cache read path used by the CPU-fallback
++// matmul; see supports_op in ggml-cuda.cu).
++void ggml_cuda_cpy_tq_mse_4_to_f32(
++        const char * cx, char * cdst, const int64_t ne,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02,
++        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++        const int64_t ne10, const int64_t ne11, const int64_t ne12,
++        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
++        cudaStream_t stream);
++
++// Contiguous dequant for the cuBLAS F32 fallback matmul path.
++// Signature matches `to_fp32_cuda_t` in convert.cuh:
++//     (const void * vx, float * y, int64_t k, cudaStream_t stream)
++void ggml_cuda_dequantize_row_tq_mse_4_fp32(
++        const void * vx, float * y, int64_t k, cudaStream_t stream);
++void ggml_cuda_dequantize_row_tq_mse_4_fp16(
++        const void * vx, half  * y, int64_t k, cudaStream_t stream);
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 15443aa55..b94f13488 100644
+index 15443aa55..fe4057858 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
 @@ -3,6 +3,7 @@
@@ -188,7 +697,7 @@ index 15443aa55..b94f13488 100644
  
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
-@@ -504,6 +506,237 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
+@@ -504,6 +506,256 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
      }
  }
  
@@ -316,6 +825,25 @@ index 15443aa55..b94f13488 100644
 +    }
 +}
 +
++// Accessors for other backends (e.g. the CUDA port) to pull the host-side
++// tables directly. Safe to call from any thread; the caller must already
++// have triggered init via tq_mse_4_init_impl() (or accept the first call
++// here does it for them).
++const float * ggml_tq_mse_4_host_pi(void) {
++    tq_mse_4_init_impl();
++    return g_tq_mse_4_Pi;
++}
++
++const float * ggml_tq_mse_4_host_piT(void) {
++    tq_mse_4_init_impl();
++    return g_tq_mse_4_PiT;
++}
++
++const float * ggml_tq_mse_4_host_codebook(void) {
++    tq_mse_4_init_impl();
++    return g_tq_mse_4_codebook;
++}
++
 +void tq_mse_4_init_impl(void) {
 +    // Fast path: tables already published.
 +    if (atomic_load_explicit(&g_tq_mse_4_state, memory_order_acquire) == 2) return;
@@ -427,7 +955,7 @@ index 15443aa55..b94f13488 100644
      static const int qk = QK_MXFP4;
  
 diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
-index d56c86da8..8b537821c 100644
+index d56c86da8..0ee45c98e 100644
 --- a/ggml/src/ggml-quants.h
 +++ b/ggml/src/ggml-quants.h
 @@ -35,6 +35,8 @@ GGML_API void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K *
@@ -448,7 +976,7 @@ index d56c86da8..8b537821c 100644
  GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_iq2_s  (const block_iq2_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
-@@ -107,6 +111,11 @@ GGML_API void iq2xs_free_impl(enum ggml_type type);
+@@ -107,6 +111,18 @@ GGML_API void iq2xs_free_impl(enum ggml_type type);
  GGML_API void iq3xs_init_impl(int grid_size);
  GGML_API void iq3xs_free_impl(int grid_size);
  
@@ -456,6 +984,13 @@ index d56c86da8..8b537821c 100644
 +// Must be called before quantize_row_tq_mse_4_ref / dequantize_row_tq_mse_4.
 +// Safe to call repeatedly; subsequent calls are no-ops.
 +GGML_API void tq_mse_4_init_impl(void);
++
++// Accessors for non-CPU backends (e.g. CUDA) that need to mirror the tables.
++// Each returns a 128*128 float array (Pi / Pi^T row-major) or a 16 float
++// codebook. Lazily triggers tq_mse_4_init_impl if not already done.
++GGML_API const float * ggml_tq_mse_4_host_pi(void);
++GGML_API const float * ggml_tq_mse_4_host_piT(void);
++GGML_API const float * ggml_tq_mse_4_host_codebook(void);
 +
  #ifdef __cplusplus
  }
@@ -488,14 +1023,15 @@ index eda041f45..29269fe4c 100644
              break;
      }
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index b282c3239..e3c74309b 100644
+index b282c3239..b8fe0198f 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -254,6 +254,7 @@ if (NOT GGML_BACKEND_DL)
+@@ -254,6 +254,8 @@ if (NOT GGML_BACKEND_DL)
      llama_build_and_test(test-barrier.cpp)
      llama_build_and_test(test-quantize-fns.cpp)
      llama_build_and_test(test-quantize-perf.cpp)
 +    llama_build_and_test(test-turboquant.cpp)
++    llama_build_and_test(test-turboquant-cuda.cpp)
      llama_build_and_test(test-rope.cpp)
  endif()
  
@@ -546,6 +1082,218 @@ index a05fab504..aa551ded4 100644
              failed = !(total_error < max_quantization_error);
              num_failed += failed;
              if (failed || verbose) {
+diff --git a/tests/test-turboquant-cuda.cpp b/tests/test-turboquant-cuda.cpp
+new file mode 100644
+index 000000000..7c06da3db
+--- /dev/null
++++ b/tests/test-turboquant-cuda.cpp
+@@ -0,0 +1,206 @@
++// CPU ↔ CUDA parity test for GGML_TYPE_TQ_MSE_4.
++//
++// Builds the type tables on both backends from the same deterministic
++// PRNG seed, then verifies all four cross-backend round-trips match:
++//
++//    x  --cpu_quant-->  q  --cpu_dequant-->  x_hat_cpu_cpu
++//    x  --cpu_quant-->  q  --gpu_dequant-->  x_hat_cpu_gpu
++//    x  --gpu_quant-->  q  --cpu_dequant-->  x_hat_gpu_cpu
++//    x  --gpu_quant-->  q  --gpu_dequant-->  x_hat_gpu_gpu
++//
++// Since both backends share literally the same Pi / codebook (CPU builds
++// the tables and CUDA cudaMemcpyToSymbols them), we expect:
++//   - q buffers to be byte-identical between CPU and GPU quant paths
++//   - x_hat arrays to agree to a few ULPs (Pi^T·y matmul order differs)
++//
++// Requires a CUDA backend. If compiled without CUDA, skips.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-backend.h"
++#include "ggml-alloc.h"
++
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++static float mean_sq_err(const float * a, const float * b, size_t n) {
++    double s = 0.0;
++    for (size_t i = 0; i < n; ++i) {
++        double d = (double)a[i] - (double)b[i];
++        s += d * d;
++    }
++    return (float)(s / (double)n);
++}
++
++static float max_abs_err(const float * a, const float * b, size_t n) {
++    float m = 0.0f;
++    for (size_t i = 0; i < n; ++i) {
++        float d = std::fabs(a[i] - b[i]);
++        if (d > m) m = d;
++    }
++    return m;
++}
++
++static ggml_backend_t find_cuda_backend() {
++    const size_t n = ggml_backend_reg_count();
++    for (size_t i = 0; i < n; ++i) {
++        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
++        const char * name = ggml_backend_reg_name(reg);
++        if (name && std::string(name).find("CUDA") != std::string::npos) {
++            const size_t nd = ggml_backend_reg_dev_count(reg);
++            if (nd == 0) continue;
++            ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
++            return ggml_backend_dev_init(dev, /*params=*/nullptr);
++        }
++    }
++    return nullptr;
++}
++
++// Create a 1-tensor graph that copies src -> dst (i.e. what ggml-cpy does).
++// Both tensors are allocated in `backend`'s buffer. We return the result as
++// a host-side vector.
++template <typename T>
++static std::vector<T> run_cpy_on_backend(
++        ggml_backend_t backend,
++        const float * x_host, ggml_type src_type, ggml_type dst_type,
++        int64_t n_elements) {
++    // Each tensor is a 1D row of length n_elements.
++    ggml_init_params ctx_params = { /*.mem_size=*/ 16*1024*1024,
++                                     /*.mem_buffer=*/ nullptr,
++                                     /*.no_alloc=*/ true };
++    ggml_context * ctx = ggml_init(ctx_params);
++
++    ggml_tensor * src = ggml_new_tensor_1d(ctx, src_type, n_elements);
++    ggml_tensor * dst = ggml_new_tensor_1d(ctx, dst_type, n_elements);
++    ggml_set_name(src, "src");
++    ggml_set_name(dst, "dst");
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
++    ggml_build_forward_expand(gf, cpy);
++
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf != nullptr);
++
++    // Upload src data. If src is quantized, x_host is already in packed form;
++    // if src is float, x_host is a normal float row.
++    const size_t bytes_src = ggml_nbytes(src);
++    ggml_backend_tensor_set(src, x_host, 0, bytes_src);
++
++    ggml_backend_graph_compute(backend, gf);
++
++    const size_t bytes_dst = ggml_nbytes(dst);
++    std::vector<T> out(bytes_dst / sizeof(T));
++    ggml_backend_tensor_get(dst, out.data(), 0, bytes_dst);
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    return out;
++}
++
++int main() {
++    ggml_backend_load_all();
++    ggml_cpu_init();
++
++    ggml_backend_t cpu = ggml_backend_cpu_init();
++    ggml_backend_t gpu = find_cuda_backend();
++
++    if (!gpu) {
++        printf("[test-turboquant-cuda] SKIP: no CUDA backend available.\n");
++        ggml_backend_free(cpu);
++        return 0;
++    }
++
++    // Touch the CPU tables so the CPU build has happened before we compare
++    // against GPU output (which pulls the same tables via cudaMemcpyToSymbol).
++    ggml_quantize_init(GGML_TYPE_TQ_MSE_4);
++
++    const int64_t N_BLOCKS = 8;
++    const int64_t n        = N_BLOCKS * 128;
++
++    std::mt19937 rng(17);
++    std::normal_distribution<float> gauss(0.0f, 1.0f);
++
++    std::vector<float> x(n);
++    for (int64_t i = 0; i < n; ++i) x[i] = gauss(rng);
++
++    // ---- 1. quant on each backend, compare packed bytes --------------------
++    auto q_cpu = run_cpy_on_backend<uint8_t>(cpu, x.data(), GGML_TYPE_F32, GGML_TYPE_TQ_MSE_4, n);
++    auto q_gpu = run_cpy_on_backend<uint8_t>(gpu, x.data(), GGML_TYPE_F32, GGML_TYPE_TQ_MSE_4, n);
++
++    assert(q_cpu.size() == q_gpu.size());
++    int byte_diffs = 0;
++    for (size_t i = 0; i < q_cpu.size(); ++i) {
++        if (q_cpu[i] != q_gpu[i]) ++byte_diffs;
++    }
++    printf("[test-turboquant-cuda] packed-bytes: %d/%zu differ between CPU and GPU quant\n",
++           byte_diffs, q_cpu.size());
++
++    // A few byte differs are acceptable if a rotated coord lands exactly on
++    // a codebook midpoint (different rounding direction on CPU vs GPU). The
++    // real test is whether the reconstructions agree numerically.
++    if (byte_diffs > (int)(q_cpu.size() / 20)) {
++        printf("FAIL: too many packed-byte mismatches (> 5%%)\n");
++        return 1;
++    }
++
++    // ---- 2. dequant(cpu_q) on each backend ---------------------------------
++    auto deq_cpu_from_cpu = run_cpy_on_backend<float>(cpu, (const float *)q_cpu.data(), GGML_TYPE_TQ_MSE_4, GGML_TYPE_F32, n);
++    auto deq_gpu_from_cpu = run_cpy_on_backend<float>(gpu, (const float *)q_cpu.data(), GGML_TYPE_TQ_MSE_4, GGML_TYPE_F32, n);
++
++    const float tol_mse = 1e-5f;   // matmul order differs, so allow some ULP noise
++    const float tol_max = 5e-3f;
++
++    const float mse_cc_gc = mean_sq_err(deq_cpu_from_cpu.data(), deq_gpu_from_cpu.data(), n);
++    const float mxe_cc_gc = max_abs_err(deq_cpu_from_cpu.data(), deq_gpu_from_cpu.data(), n);
++    printf("[test-turboquant-cuda] dequant parity (cpu_q → cpu vs gpu): mse=%.2e max_abs=%.2e\n",
++           mse_cc_gc, mxe_cc_gc);
++    if (!(mse_cc_gc < tol_mse && mxe_cc_gc < tol_max)) {
++        printf("FAIL: dequant(cpu_q) diverges between backends\n");
++        return 1;
++    }
++
++    // ---- 3. dequant(gpu_q) on each backend ---------------------------------
++    auto deq_cpu_from_gpu = run_cpy_on_backend<float>(cpu, (const float *)q_gpu.data(), GGML_TYPE_TQ_MSE_4, GGML_TYPE_F32, n);
++    auto deq_gpu_from_gpu = run_cpy_on_backend<float>(gpu, (const float *)q_gpu.data(), GGML_TYPE_TQ_MSE_4, GGML_TYPE_F32, n);
++
++    const float mse_cg_gg = mean_sq_err(deq_cpu_from_gpu.data(), deq_gpu_from_gpu.data(), n);
++    const float mxe_cg_gg = max_abs_err(deq_cpu_from_gpu.data(), deq_gpu_from_gpu.data(), n);
++    printf("[test-turboquant-cuda] dequant parity (gpu_q → cpu vs gpu): mse=%.2e max_abs=%.2e\n",
++           mse_cg_gg, mxe_cg_gg);
++    if (!(mse_cg_gg < tol_mse && mxe_cg_gg < tol_max)) {
++        printf("FAIL: dequant(gpu_q) diverges between backends\n");
++        return 1;
++    }
++
++    // ---- 4. full round-trip error on GPU -----------------------------------
++    // Normalize x to unit norm per 128-block and see that round-trip MSE is
++    // in the right ballpark (~10^-4 per coord; CPU baseline gets ~7e-5).
++    std::vector<float> x_unit = x;
++    for (int64_t b = 0; b < N_BLOCKS; ++b) {
++        double s = 0;
++        for (int i = 0; i < 128; ++i) s += (double)x_unit[b*128+i] * x_unit[b*128+i];
++        s = std::sqrt(s);
++        if (s > 0) for (int i = 0; i < 128; ++i) x_unit[b*128+i] /= (float)s;
++    }
++    auto qu_gpu = run_cpy_on_backend<uint8_t>(gpu, x_unit.data(), GGML_TYPE_F32, GGML_TYPE_TQ_MSE_4, n);
++    auto xh_gpu = run_cpy_on_backend<float>(gpu, (const float *)qu_gpu.data(), GGML_TYPE_TQ_MSE_4, GGML_TYPE_F32, n);
++    const float rt_mse = mean_sq_err(x_unit.data(), xh_gpu.data(), n);
++    printf("[test-turboquant-cuda] unit-norm GPU round-trip MSE: %.5f (CPU baseline ~7e-5)\n",
++           rt_mse);
++    if (!(rt_mse < 5e-3f)) {
++        printf("FAIL: round-trip MSE too high\n");
++        return 1;
++    }
++
++    printf("[test-turboquant-cuda] OK\n");
++
++    ggml_backend_free(gpu);
++    ggml_backend_free(cpu);
++    return 0;
++}
 diff --git a/tests/test-turboquant.cpp b/tests/test-turboquant.cpp
 new file mode 100644
 index 000000000..158fdc449

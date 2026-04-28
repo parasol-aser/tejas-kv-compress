@@ -66,15 +66,21 @@ cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
       -DLLAMA_CURL=OFF \
       -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$BUILD_DIR" -j "$(nproc)" \
-      --target test-turboquant test-turboquant-cuda llama-completion
+      --target test-turboquant test-turboquant-prod \
+              test-turboquant-cuda test-turboquant-prod-cuda \
+              llama-completion
 
-# ----- 2. CPU baseline -------------------------------------------------------
-echo "== step 2: CPU round-trip (test-turboquant) =="
+# ----- 2. CPU baselines ------------------------------------------------------
+echo "== step 2a: CPU round-trip TQ_MSE_4 (test-turboquant) =="
 "$BUILD_DIR/bin/test-turboquant"
+echo "== step 2b: CPU round-trip TQ_PROD_4 (test-turboquant-prod) =="
+"$BUILD_DIR/bin/test-turboquant-prod"
 
-# ----- 3. CPU ↔ CUDA parity --------------------------------------------------
-echo "== step 3: CPU↔CUDA parity (test-turboquant-cuda) =="
+# ----- 3. CPU <-> CUDA parity ------------------------------------------------
+echo "== step 3a: CPU<->CUDA parity TQ_MSE_4 (test-turboquant-cuda) =="
 "$BUILD_DIR/bin/test-turboquant-cuda"
+echo "== step 3b: CPU<->CUDA parity TQ_PROD_4 (test-turboquant-prod-cuda) =="
+"$BUILD_DIR/bin/test-turboquant-prod-cuda"
 
 # ----- 4. End-to-end generation (optional) -----------------------------------
 if [[ -n "$MODEL" ]]; then
@@ -100,9 +106,18 @@ if [[ -n "$MODEL" ]]; then
         --cache-type-k tq_mse_4 --cache-type-v f16 \
         --jinja -ngl 99 | tail -n 10
 
+    echo "-- tq_prod_4 (--cache-type-k tq_prod_4) --"
+    "$BUILD_DIR/bin/llama-completion" \
+        -m "$MODEL" \
+        -p "The capital of France is" \
+        -n 20 \
+        --cache-type-k tq_prod_4 --cache-type-v f16 \
+        --jinja -ngl 99 | tail -n 10
+
     echo
-    echo "If both generations produced reasonable tokens (e.g. \"Paris\"), the"
-    echo "CUDA KV-cache write + cuBLAS-F32 fallback path is end-to-end correct."
+    echo "If all three generations produced reasonable tokens (e.g. \"Paris\"), the"
+    echo "CUDA KV-cache write + cuBLAS-F32 fallback path is end-to-end correct"
+    echo "for both TurboQuant variants."
 fi
 
 echo "== all done =="

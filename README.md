@@ -9,12 +9,12 @@ Experiments with KV-cache compression for LLM inference.
   (Algorithm 2). Has a `run_tests()` entry point for quick round-trip and
   unbiasedness checks.
 - **`patches/turboquant-llama.cpp.patch`** — integration of TurboQuant
-  into llama.cpp. Adds two head-dim-128 KV-cache quant types:
+  into llama.cpp. Adds two head-dim-128 KV-cache quant types, both with
+  CPU + CUDA paths:
     - `GGML_TYPE_TQ_MSE_4`  (`--cache-type-k tq_mse_4`)  — Algorithm 1, 4.125 bpv.
-      CPU + CUDA.
     - `GGML_TYPE_TQ_PROD_4` (`--cache-type-k tq_prod_4`) — Algorithm 2 (MSE +
-      1-bit JL sketch on the residual), 5.25 bpv. CPU only so far; CUDA is a
-      separate follow-up.
+      1-bit JL sketch on the residual), 5.25 bpv. Unbiased inner-product
+      estimator.
   Applies against upstream `ggml-org/llama.cpp@cf8b0dbda`.
 - **`scripts/test-cuda-turboquant.sh`** — one-shot script for a GPU box:
   applies the patch, builds with CUDA, runs the CPU baseline test, the

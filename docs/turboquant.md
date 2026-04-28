@@ -81,8 +81,8 @@ Backend matrix:
 
 | backend | TQ_MSE_4 KV write | TQ_MSE_4 KV read | TQ_PROD_4 KV write | TQ_PROD_4 KV read | attention matmul |
 |---|---|---|---|---|---|
-| CPU  | ref `quantize_row_tq_mse_4`  | ref `dequantize_row_tq_mse_4`  | ref `quantize_row_tq_prod_4`  | ref `dequantize_row_tq_prod_4` | scratch-dequant + plain F32 dot |
-| CUDA | fused kernel, 128 threads / block | fused kernel, 128 threads / block | not yet | not yet | cuBLAS F32 fallback (K dequantized via `ggml_cuda_dequantize_row_tq_mse_4_fp32`) |
+| CPU  | ref `quantize_row_tq_mse_4`     | ref `dequantize_row_tq_mse_4`     | ref `quantize_row_tq_prod_4`     | ref `dequantize_row_tq_prod_4`     | scratch-dequant + plain F32 dot |
+| CUDA | fused kernel, 128 threads/block | fused kernel, 128 threads/block | fused kernel, 128 threads/block | fused kernel, 128 threads/block | cuBLAS F32 fallback (K dequantized via `ggml_cuda_dequantize_row_tq_*_fp32`) |
 
 Both backends build the rotation matrix `Π` and codebook on the CPU from the
 same deterministic xoshiro256** seed; the CUDA path then `cudaMemcpyToSymbol`s
@@ -116,16 +116,21 @@ tests/test-turboquant.cpp        +131  # MSE-4 round-trip + vec_dot sanity (CPU)
 tests/test-turboquant-prod.cpp   +166  # Prod-4 round-trip + vec_dot + IP sanity (CPU)
 ```
 
-CUDA path (TQ_MSE_4 only — TQ_PROD_4 CUDA support is a separate follow-up):
+CUDA path (covers both types):
 
 ```
-ggml/src/ggml-cuda/convert.cu   +5    # register fp32/fp16 dequant in the to-*_cuda tables
-ggml/src/ggml-cuda/cpy.cu       +7    # dispatch F32↔TQ_MSE_4 on CUDA
-ggml/src/ggml-cuda/ggml-cuda.cu +14   # supports_op: allow CPY + MUL_MAT;
-                                      # exclude TQ from MMVQ / MMQ to force cuBLAS fallback
-ggml/src/ggml-cuda/tq_mse_4.cu  +344  # device tables, init, quant/dequant kernels
-ggml/src/ggml-cuda/tq_mse_4.cuh +45   # declarations
-tests/test-turboquant-cuda.cpp  +206  # CPU ↔ GPU parity + GPU round-trip
+ggml/src/ggml-cuda/convert.cu        +9    # register fp32/fp16 dequant for both
+ggml/src/ggml-cuda/cpy.cu            +14   # dispatch F32 <-> TQ_{MSE,PROD}_4 on CUDA
+ggml/src/ggml-cuda/ggml-cuda.cu      +20   # supports_op: allow CPY + MUL_MAT;
+                                           # exclude both TQ types from MMVQ/MMQ
+ggml/src/ggml-cuda/tq_mse_4.cu       +344  # MSE-4 device tables, init, quant/dequant
+ggml/src/ggml-cuda/tq_mse_4.cuh      +45   # MSE-4 declarations
+ggml/src/ggml-cuda/tq_prod_4.cu      +323  # Prod-4 M / M^T device tables (Pi/codebook
+                                           # are reused via extern from tq_mse_4.cu),
+                                           # init, JL-aware quant/dequant kernels
+ggml/src/ggml-cuda/tq_prod_4.cuh     +43   # Prod-4 declarations
+tests/test-turboquant-cuda.cpp       +206  # CPU<->GPU parity + GPU round-trip (MSE-4)
+tests/test-turboquant-prod-cuda.cpp  +200  # CPU<->GPU parity + GPU round-trip (Prod-4)
 ```
 
 ## Design decisions
@@ -324,12 +329,25 @@ can differ by a few ULPs in the last place. The CUDA test
 - Round-trip MSE on GPU is within the CPU ballpark (~7e-5 per coord on
   unit vectors).
 
+## TQ_PROD_4 on CUDA
+
+The Prod variant follows the same pattern as the MSE variant: CPU builds the
+M / M^T tables (with a distinct PRNG seed, 43, vs. 42 for Pi), CUDA mirrors
+them to `__device__` globals via `cudaMemcpyToSymbolAsync` on first use. The
+quant kernel reuses the MSE-4 stage in shared memory (rotate, pick centroid,
+form residual) and adds the JL sketch: each thread computes its row of
+`M @ r_rot`, emits a 1-bit sign, and threads cooperate per-byte to pack 8
+sign bits each. The dequant kernel decodes the MSE indices and JL bits in
+parallel, computes `M^T @ qjl_signed` per thread, adds the JL correction to
+the rotated reconstruction, then applies `Pi^T` and the norm scale.
+
+The Pi / Pi^T / codebook arrays are NOT redeclared in `tq_prod_4.cu` — they
+are pulled in via `extern __device__` declarations referencing the symbols
+defined in `tq_mse_4.cu`. A model that uses both types simultaneously
+(unusual, but allowed) shares one copy of those tables on the device.
+
 ## Known limits / future work
 
-- **TQ_PROD_4 is CPU-only so far.** Algorithm 2 / `GGML_TYPE_TQ_PROD_4`
-  is implemented on CPU end to end; the matching CUDA kernels (cpy
-  F32↔TQ_PROD_4, fp32 / fp16 dequant for the cuBLAS fallback) are a
-  separate follow-up commit.
 - **No fused vec-dot on CUDA.** The clever identity
   `<Πᵀỹ, q> = <ỹ, Πq>` lets you precompute `Πq` once per row and reduce
   each block's contribution to a plain 128-way dot. That's the real

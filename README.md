@@ -8,9 +8,13 @@ Experiments with KV-cache compression for LLM inference.
   both the MSE quantizer (Algorithm 1) and the product/JL variant
   (Algorithm 2). Has a `run_tests()` entry point for quick round-trip and
   unbiasedness checks.
-- **`patches/turboquant-llama.cpp.patch`** — CPU + CUDA integration of
-  TurboQuant MSE (4-bit, head-dim 128) into llama.cpp as a new KV-cache
-  quantization type `GGML_TYPE_TQ_MSE_4` / `--cache-type-k tq_mse_4`.
+- **`patches/turboquant-llama.cpp.patch`** — integration of TurboQuant
+  into llama.cpp. Adds two head-dim-128 KV-cache quant types:
+    - `GGML_TYPE_TQ_MSE_4`  (`--cache-type-k tq_mse_4`)  — Algorithm 1, 4.125 bpv.
+      CPU + CUDA.
+    - `GGML_TYPE_TQ_PROD_4` (`--cache-type-k tq_prod_4`) — Algorithm 2 (MSE +
+      1-bit JL sketch on the residual), 5.25 bpv. CPU only so far; CUDA is a
+      separate follow-up.
   Applies against upstream `ggml-org/llama.cpp@cf8b0dbda`.
 - **`scripts/test-cuda-turboquant.sh`** — one-shot script for a GPU box:
   applies the patch, builds with CUDA, runs the CPU baseline test, the
@@ -33,8 +37,11 @@ cmake -B build -DGGML_CUDA=OFF
 cmake --build build -j
 
 ./build/bin/test-turboquant
+./build/bin/test-turboquant-prod
 ./build/bin/llama-completion -m your-model.gguf -p "..." \
     --cache-type-k tq_mse_4 --cache-type-v f16 --jinja
+./build/bin/llama-completion -m your-model.gguf -p "..." \
+    --cache-type-k tq_prod_4 --cache-type-v f16 --jinja
 ```
 
 ## Quick start — CUDA (A100 / H100)

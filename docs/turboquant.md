@@ -7,7 +7,9 @@ This directory documents the llama.cpp integration of TurboQuant
 
 ## What the algorithm does
 
-TurboQuant MSE (Algorithm 1 of the paper):
+The paper has two algorithms; both are implemented.
+
+### Algorithm 1 — TurboQuant MSE (`GGML_TYPE_TQ_MSE_4`)
 
 1. Draw a fixed random orthogonal matrix `Π` of size `d×d` (once, at startup).
 2. Per input vector `x ∈ R^d`:
@@ -26,27 +28,61 @@ vector regardless of the original basis the data was expressed in. This is the
 whole reason the paper's MSE guarantee doesn't depend on the data
 distribution.
 
+### Algorithm 2 — TurboQuant Prod (`GGML_TYPE_TQ_PROD_4`)
+
+Adds a JL sign-sketch correction on top of the Algorithm 1 reconstruction so
+that the inner-product estimator `<y, x̂>` becomes *unbiased* (Algorithm 1's
+estimator is biased because the codebook always rounds toward the nearest
+centroid, never away from it).
+
+Building on the MSE stage above, also draw a fixed `d×d` matrix `M` with iid
+Gaussian entries (independent of `Π`, distinct PRNG seed). Per block:
+
+1. Run Algorithm 1 to get `idx[]` and the rotated reconstruction
+   `ỹ = codebook[idx]`. Form the residual *in rotated space*
+   `r = y - ỹ` (where `y = Π u` from Algorithm 1).
+2. Sketch the residual: `qjl[i] = sign((M r)[i])` — one bit per dim.
+3. Store `γ = ‖r‖` as a second fp16 scale.
+
+Block layout: `‖x‖` + `γ` + `idx[]` (4-bit) + `qjl[]` (1-bit) = 84 B / 128 elem
+= **5.25 bpv**.
+
+Dequantize:
+```
+ỹ_full = codebook[idx] + (√(π/2) / d) · γ · M^T · qjl_signed
+x̂      = ‖x‖ · Π^T · ỹ_full
+```
+
+The coefficient `√(π/2)/d` is the inverse JL constant: for iid Gaussian `M`,
+`E[M^T sign(M r)] = (d / √(π/2)) · r/‖r‖`, so the term recovers `r` in
+expectation. That makes `E[x̂] = x` (over the randomness of `M`), hence
+`E[<y, x̂>] = <y, x>`.
+
+Note we sketch in *rotated* space rather than the prototype's unit space. The
+two are equivalent in distribution — `M` plays the role of `S · Π^T` from
+the prototype — and rotated-space sketching saves one matmul per quant and per
+dequant.
+
 ## What the llama.cpp integration does
 
-The patch adds a single new ggml tensor type, `GGML_TYPE_TQ_MSE_4`:
+The patch adds two new ggml tensor types:
 
-| field | value |
-|---|---|
-| block size (elements) | 128 (one head) |
-| bits per element | 4 |
-| block layout | `fp16 scale` + `64 B` of packed nibbles (code indices) |
-| bits per value on disk | `66·8/128 = 4.125` |
-| vec-dot type (CPU) | `F32` (query stays float, no extra precision loss) |
-
-It is reachable from the CLI as `--cache-type-k tq_mse_4`. The type can be
-used for K only (not V) — see "Why K only" below.
-
-Both the CPU path and a CUDA PoC path are in the same patch:
-
-| backend | KV write | KV read (dequant) | attention matmul |
+| type | bits per element on disk | block layout (per 128 elem) | algorithm |
 |---|---|---|---|
-| CPU    | ref `quantize_row_tq_mse_4`        | ref `dequantize_row_tq_mse_4` | scratch-dequant + plain F32 dot |
-| CUDA   | fused kernel, 128 threads / block  | fused kernel, 128 threads / block | cuBLAS F32 fallback (K dequantized to a scratch buffer by `ggml_cuda_dequantize_row_tq_mse_4_fp32`) |
+| `GGML_TYPE_TQ_MSE_4`  | 4.125 | `fp16 ‖x‖` + `64 B` of 4-bit indices                                       | Algorithm 1 |
+| `GGML_TYPE_TQ_PROD_4` | 5.250 | `fp16 ‖x‖` + `fp16 γ` + `64 B` 4-bit indices + `16 B` 1-bit JL sign bits | Algorithm 2 |
+
+Both are reachable from the CLI as `--cache-type-k tq_mse_4` /
+`tq_prod_4`. Block size is 128 (one head); CPU vec-dot type is F32 for both
+(query stays float, no extra precision loss). Both can be used for K only (not
+V) — see "Why K only" below.
+
+Backend matrix:
+
+| backend | TQ_MSE_4 KV write | TQ_MSE_4 KV read | TQ_PROD_4 KV write | TQ_PROD_4 KV read | attention matmul |
+|---|---|---|---|---|---|
+| CPU  | ref `quantize_row_tq_mse_4`  | ref `dequantize_row_tq_mse_4`  | ref `quantize_row_tq_prod_4`  | ref `dequantize_row_tq_prod_4` | scratch-dequant + plain F32 dot |
+| CUDA | fused kernel, 128 threads / block | fused kernel, 128 threads / block | not yet | not yet | cuBLAS F32 fallback (K dequantized via `ggml_cuda_dequantize_row_tq_mse_4_fp32`) |
 
 Both backends build the rotation matrix `Π` and codebook on the CPU from the
 same deterministic xoshiro256** seed; the CUDA path then `cudaMemcpyToSymbol`s
@@ -60,26 +96,27 @@ few ULPs.
 
 The patch touches 19 files under `llama.cpp/`:
 
-CPU path (15 files):
+CPU path (covers both TQ_MSE_4 and TQ_PROD_4):
 
 ```
-common/arg.cpp                  +1    # expose tq_mse_4 to --cache-type-k parser
-ggml/include/ggml.h             +2    # GGML_TYPE_TQ_MSE_4 = 42, COUNT = 43
-ggml/src/ggml-common.h          +11   # block_tq_mse_4 struct + QK_TQ_MSE_4
-ggml/src/ggml-cpu/ggml-cpu.c    +6    # type_traits_cpu entry
-ggml/src/ggml-cpu/ops.cpp       +1    # clamp switch case (no-op)
-ggml/src/ggml-cpu/quants.c      +39   # from_float forwarder + vec_dot
-ggml/src/ggml-cpu/quants.h      +5    # declarations
-ggml/src/ggml-quants.c          +252  # codebook, rotation, quant/dequant,
-                                      #  PRNG, init, host-side accessors
-ggml/src/ggml-quants.h          +16   # declarations
-ggml/src/ggml.c                 +9    # ggml_type_traits entry + init dispatch
-tests/CMakeLists.txt            +2    # register both turboquant tests
-tests/test-quantize-fns.cpp     +15   # buffer-size fix + per-type error bound
-tests/test-turboquant.cpp       +131  # round-trip + vec_dot sanity (CPU)
+common/arg.cpp                   +2    # expose tq_mse_4, tq_prod_4 to --cache-type-k parser
+ggml/include/ggml.h              +3    # GGML_TYPE_TQ_MSE_4 = 42, TQ_PROD_4 = 43
+ggml/src/ggml-common.h           +28   # block_tq_mse_4 + block_tq_prod_4 structs
+ggml/src/ggml-cpu/ggml-cpu.c     +12   # type_traits_cpu entries
+ggml/src/ggml-cpu/ops.cpp        +2    # clamp switch cases (no-op)
+ggml/src/ggml-cpu/quants.c       +78   # from_float forwarders + vec_dot for both
+ggml/src/ggml-cpu/quants.h       +9    # declarations
+ggml/src/ggml-quants.c           +437  # codebooks, Pi, M, quant/dequant, PRNG,
+                                       #  init, host-side accessors for both types
+ggml/src/ggml-quants.h           +25   # declarations
+ggml/src/ggml.c                  +18   # ggml_type_traits entries + init dispatch
+tests/CMakeLists.txt             +3    # register all three turboquant tests
+tests/test-quantize-fns.cpp      +18   # buffer-size fix + per-type error bounds
+tests/test-turboquant.cpp        +131  # MSE-4 round-trip + vec_dot sanity (CPU)
+tests/test-turboquant-prod.cpp   +166  # Prod-4 round-trip + vec_dot + IP sanity (CPU)
 ```
 
-CUDA path (4 files):
+CUDA path (TQ_MSE_4 only — TQ_PROD_4 CUDA support is a separate follow-up):
 
 ```
 ggml/src/ggml-cuda/convert.cu   +5    # register fp32/fp16 dequant in the to-*_cuda tables
@@ -289,9 +326,10 @@ can differ by a few ULPs in the last place. The CUDA test
 
 ## Known limits / future work
 
-- **MSE only.** Algorithm 2 of the paper (TurboQuantProd: MSE stage +
-  JL-sign residual) is not implemented; it doesn't fit one block cleanly
-  because it emits a `(idx, sign_bits, γ)` triple.
+- **TQ_PROD_4 is CPU-only so far.** Algorithm 2 / `GGML_TYPE_TQ_PROD_4`
+  is implemented on CPU end to end; the matching CUDA kernels (cpy
+  F32↔TQ_PROD_4, fp32 / fp16 dequant for the cuBLAS fallback) are a
+  separate follow-up commit.
 - **No fused vec-dot on CUDA.** The clever identity
   `<Πᵀỹ, q> = <ỹ, Πq>` lets you precompute `Πq` once per row and reduce
   each block's contribution to a plain 128-way dot. That's the real
